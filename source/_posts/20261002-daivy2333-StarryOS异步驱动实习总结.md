@@ -15,7 +15,7 @@ tags:
 
 ## 摘要
 
-在 StarryOS 上进行的异步驱动开发工作，为内核构建异步串口与异步网卡两个驱动，覆盖从中断响应、环形缓冲与描述符队列，到 TTY 行规程与协议栈接入、多核绑核调度的完整链路。核心工作包括三项：异步串口驱动，采用"中断只唤醒、后台任务搬运"的结构，ISR 精简至约 25 行，配合双 SPSC 环形缓冲与非阻塞 I/O，在 Lichee RV Dock D1 真板上将 64B 短包写到 96.6% 物理线速；异步网卡驱动，从硬件到应用分五层，发送以代际号与序号记账，提交、完成、回收三处计数闭合后才复用缓冲区，恢复语义区分等待者取消、提交前撤销与设备持有三种情况，在 QEMU 十六核（SMP=16）下实现 TCP/UDP 双向收发、poll/select 就绪通知与故障注入后的恢复；以及统一处理流程与多核适配，两个驱动遵循"四段流程加四条规则"的同一套写法，后台角色固定绑核、跨核恰好一次 IPI 唤醒，两驱动在同一内核中长期共存工作。在此基础上，通过 D1 真板测试与 qemu SMP=16 六组场景，验证驱动功能性能。
+本文总结了在 StarryOS 上进行的异步驱动开发工作，为内核构建异步串口与异步网卡两个驱动，覆盖从中断响应、环形缓冲与描述符队列，到 TTY 行规程与协议栈接入、多核绑核调度的完整链路。核心工作包括三项：异步串口驱动，采用"中断只唤醒、后台任务搬运"的结构，ISR 精简至约 25 行，配合双 SPSC 环形缓冲与非阻塞 I/O，在 Lichee RV Dock D1 真板上将 64B 短包写到 96.6% 物理线速；异步网卡驱动，从硬件到应用分五层，发送以代际号与序号记账，提交、完成、回收三处计数闭合后才复用缓冲区，恢复语义区分等待者取消、提交前撤销与设备持有三种情况，在 QEMU 十六核（SMP=16）下实现 TCP/UDP 双向收发、poll/select 就绪通知与故障注入后的恢复；以及统一处理流程与多核适配，两个驱动遵循"四段流程加四条规则"的同一套写法，后台角色固定绑核、跨核恰好一次 IPI 唤醒，两驱动在同一内核中长期共存工作。在此基础上，通过 D1 真板基准测试与 SMP=16 六组场景验证驱动正确性，六组场景全部通过，探针退出码 0。
 
 <!-- more -->
 
@@ -64,11 +64,30 @@ tags:
 
 流程层统一，数据结构层按设备设计，不做强行抽象：completion 语义、背压表达、故障分类在两个设备上完全不同，强抽 trait 会退化。这套"流程照规则写、数据层按设备设计"的做法是实习的主要产出。
 
+四段流程在两个驱动里的对应实现：
+
+| 流程段 | 串口 | 网卡 |
+|---|---|---|
+| 收中断、识别原因 | [`uart_16550/src/async_/isr.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/uart_16550/src/async_/isr.rs) 读 ISR 与 LSR 寄存器确定位型 | [`kernel/src/drivers/virtio_net_irq.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/virtio_net_irq.rs) 读 VirtIO 中断状态 |
+| 唤醒 | 按位型唤醒 RX、TX、DRAIN 三个 `AtomicWaker` | 唤醒队列 owner 注册的 waker |
+| 调度任务 | axtask 调度 RX/TX copier 任务 | axtask 调度队列 owner 任务 |
+
 网卡开发与测试全程，异步串口一直承担控制台 I/O——SMP=16 那轮运行的记录本身就是经串口打印的。两个驱动在同一内核共存，说明这套流程规则能支撑更多同路径异步驱动。
 
 ## 串口：字节流加双环形缓冲
 
-串口数据是字节流，收发各用一个无锁 SPSC 环形缓冲（每方向 64 KiB）。RX/TX 两个 copier 任务在缓冲与硬件 FIFO 之间搬数据，ISR 只读状态、关中断、唤醒，约 25 行。向上经 TTY 行规程接到用户 `read/write`，TX 方向多一层 `tcdrain` 排空等待与慢轮询回退。驱动通过 `OsRuntime`/`OsWakerSet` 两个 trait 对接操作系统，不绑定具体任务与轮询实现，换平台只换适配层。
+串口数据是字节流，模块都在 `uart_16550` crate 的 `async_` 目录与内核的 `drivers` 目录下：
+
+| 模块 | 文件 | 作用 |
+|---|---|---|
+| ISR | [`async_/isr.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/uart_16550/src/async_/isr.rs) | 读 ISR 寄存器识别中断类型，关对应 IER 位，唤醒 RX/TX/DRAIN 三个 `embassy_sync::AtomicWaker` 之一；`IRQ_COUNT` 记录中断次数 |
+| copier 任务 | [`async_/driver.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/uart_16550/src/async_/driver.rs) | RX/TX 两个后台任务在硬件 FIFO 与环形缓冲间搬数据，NAPI 中断合并 |
+| 环形缓冲 | [`async_/ring_buffer.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/uart_16550/src/async_/ring_buffer.rs) | SPSC 无锁队列，静态分配，收发各 64 KiB |
+| 字符设备 | [`async_/device_ops.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/uart_16550/src/async_/device_ops.rs) | `AsyncUartReader`/`AsyncUartWriter` 实现 `embedded_io_async`，`flush` 提供 `tcdrain` 语义 |
+| TTY 绑定 | [`kernel/src/drivers/ntty_async.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/ntty_async.rs) | `ASYNC_TTY` 以 `ProcessMode::External` 把 tty-reader 的 waker 挂到 RX 环形缓冲的 PollSet |
+| OS 抽象 | [`kernel/src/drivers/os_arceos.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/os_arceos.rs) | 62 行实现 `OsRuntime` 与 `OsWakerSet` 两个 trait，对接 axtask 与 axpoll |
+
+关键机制三处。ISR 内不做数据搬运，只读寄存器、关中断、唤醒，处理函数约 25 行。RX copier 带 NAPI 中断合并：连续 16 次读到数据（`NAPI_THRESHOLD = 16`）后关中断进入轮询模式，每轮批量读 64 次（`NAPI_BATCH_SIZE = 64`），FIFO 抽空后重新开中断回到睡眠；TX 方向对称，另有一层 `flush()` 等 LSR 的 TEMT 位（发送移位寄存器空）实现 `tcdrain`，由 DRAIN_WAKER 唤醒。TTY 行规程通过 `ProcessMode::External` 改成被唤醒驱动，不再轮询缓冲。
 
 D1 真板基准（2026-07-07 采集，115200 bps 物理线速 11.52 KB/s）：
 
@@ -88,9 +107,29 @@ D1 真板基准（2026-07-07 采集，115200 bps 物理线速 11.52 KB/s）：
 
 ## 网卡：整包分五层
 
-网卡以整包为粒度，从硬件到应用分五层。ISR 只清中断并唤醒。队列 owner 是唯一后台任务，收（reap/refill）与发（submit/reclaim）按预算推进。栈 runner 常驻，推进 smoltcp 的收发、维护与定时器。就绪桥把单槽 waker 展开成多等待者，socket 就绪状态接到 poll/select。
+网卡以整包为粒度，从硬件到应用分五层，代码集中在 `axnet` crate：
 
-发送侧每次发送记录代际号与序号，提交、完成、回收三处计数闭合后缓冲区才复用，迟到的完成通知不跨代生效。恢复按等待者取消、提交前撤销与设备持有三段区分，超时与设备复位分阶段处理，复位必须确认设备状态清零后才重建队列。
+| 层 | 职责 | 代码 |
+|---|---|---|
+| ISR | 读 VirtIO 中断状态、清中断、唤醒 | [`kernel/src/drivers/virtio_net_irq.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/virtio_net_irq.rs) |
+| 队列 owner | 唯一后台任务，收（reap/refill）与发（submit/reclaim）按预算推进 | [`axnet/src/service.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/service.rs) 与 [`async_rx.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/async_rx.rs) |
+| 栈 runner | 常驻任务，推进 smoltcp 收发、维护与定时器 | [`axnet/src/stack_runner.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/stack_runner.rs) |
+| 就绪桥 | 把 smoltcp 单槽 waker 展开成多等待者，接 poll/select | [`axnet/src/readiness.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/readiness.rs) |
+| socket | TCP/UDP 公共句柄 | [`axnet/src/socket.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/socket.rs) |
+
+数据结构四组，各有账本。
+
+定长槽位。`FixedFrameQueue`（[`device/fixed_queue.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/device/fixed_queue.rs)）用固定容量槽位存整包，内存占用有硬上界，队列压满时新包显式拒绝而不是无限缓存。
+
+发送票号。每次发送向 `TicketTracker` 领一张递增票号，状态从 Queued 经 `mark_device_owned` 转到设备持有，回收时按票号销账；存活票上限 128 张（`MAX_LIVE_TICKETS`）。`QueueEpoch` 随队列重建推进，完成通知带的票号属于旧代际直接作废，缓冲区只有提交、完成、回收三处计数闭合后才复用。
+
+每轮预算。owner 的收、回收、提交各 32（`RX_BUDGET`/`RECLAIM_BUDGET`/`SUBMIT_BUDGET`），栈 runner 每阶段 32（`STACK_STAGE_BUDGET`）。一轮做不完留到下一轮，由 waker 接力，不空转。
+
+flush 语义。`FlushTicket`/`FlushWaiter`（[`flush.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axnet/src/flush.rs)）记录当前 `last_accepted` 票号为目标，等所有小于等于目标的存活票回收后完成，目标之后提交的票不等——语义对应串口的 `tcdrain`。
+
+就绪通知。每个公共 socket 句柄持有一个 `ReadinessBridge`，读、写、终态各挂一组 `PollSet`；smoltcp 的一次性单槽 waker 注册到桥上，桥把就绪事件扇出到 poll/select 注册的多个等待者。
+
+恢复语义。取消按等待者取消、提交前撤销、设备持有三段区分；对外终态收敛为 6 种（连接复位、链路断开、超时、取消、所有权错误、设备 I/O），各带稳定错误码；复位必须确认设备状态清零后才重建队列。
 
 SMP=16 六组场景（2026-09-26 运行；队列 owner 固定 hart 15、栈 runner 固定 hart 0、串口 RX/TX copier 分别在 hart 13/14）：
 
@@ -107,10 +146,10 @@ SMP=16 六组场景（2026-09-26 运行；队列 owner 固定 hart 15、栈 runn
 
 ## 多核适配：绑核与跨核唤醒
 
-K3（进迭时空）AP 域有 8 个 X100 加 8 个 A100 共 16 核，两个驱动的后台角色固定绑核：角色 i 落在可调度集合第 (anchor + i) 个核上，绑定在入队前完成。调度组件为此增加入队前绑核与远端唤醒 IPI；内核临界区从"只关本地中断"升级为"本地中断恢复 + 全局互斥 + 每核嵌套计数"。唤醒本地优先，必须跨核时恰好发一次 IPI，避免唤醒风暴。串口与网卡各带一组快照命令，可直接读出每个后台角色跑在哪个核。
+K3（进迭时空）AP 域有 8 个 X100 加 8 个 A100 共 16 核，两个驱动的后台角色固定绑核。绑核与唤醒走 `axtask` 新增的三处能力：`spawn_with_name_affinity` 在任务入队前完成绑定，调度器按 `AxCpuMask` 选运行队列；`send_reschedule_ipi` 向目标核发一次远端唤醒 IPI；`ipi_sent_count`/`ipi_received_count` 逐核计数，测试里 191 = 191 即靠这对计数对账。角色落点集中在 [`kernel/src/drivers/net_placement.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/net_placement.rs)：owner hart 15、runner hart 0、串口 RX/TX copier hart 13/14。观测两组：[`uart_smp_snapshot.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/uart_smp_snapshot.rs) 与 [`net_wake_witness.rs`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/kernel/src/drivers/net_wake_witness.rs)，直接读出每个角色跑在哪个核、IPI 是否丢失。内核临界区从"只关本地中断"升级为"本地中断恢复 + 全局互斥 + 每核嵌套计数"。唤醒本地优先，必须跨核时恰好发一次 IPI，避免唤醒风暴。
 
-多核过程中修掉两个问题。TX 方向丢唤醒，通过在 waker 注册后重查硬件状态加重试解决。release 构建越界读出"幽灵核"，CPU 掩码加容量检查后 fail closed。
+多核过程中修掉两个问题。TX 方向丢唤醒，通过在 waker 注册后重查硬件状态加重试解决。release 构建越界读出"幽灵核"，`AxCpuMask` 的 [`try_one_shot`/`set`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axtask/src/cpumask.rs) 加容量检查后越界返回错误，不再读出幽灵核。
 
 ## 不足与后续
 
-异步串口和异步网卡的开发基本完成。受时间、精力和能力限制，性能优化与基准对比测试还没做；到本报告完成时，SMP=16 多核场景也只在 QEMU 上验证了串口与网卡的输入输出，K3 真板验证待做。后续我会在 K3 真板上继续做能落地的工作，并一直在日志仓库更新周报直至实习正式结束。
+异步串口和异步网卡的开发基本完成。受时间、精力和能力限制，性能优化与基准对比测试还没做；到本报告完成时，SMP=16 多核场景也只在 QEMU 上验证了串口与网卡的输入输出，K3 真板验证待做。后续我会在 K3 真板上继续做能落地的工作，并一直在日志仓库更新周报。
