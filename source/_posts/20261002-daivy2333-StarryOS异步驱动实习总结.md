@@ -150,6 +150,10 @@ K3（进迭时空）AP 域有 8 个 X100 加 8 个 A100 共 16 核，两个驱�
 
 多核过程中修掉两个问题。TX 方向丢唤醒，通过在 waker 注册后重查硬件状态加重试解决。release 构建越界读出"幽灵核"，`AxCpuMask` 的 [`try_one_shot`/`set`](https://github.com/daivy2333/StarryOS/blob/mul-hart-k3/crates/axtask/src/cpumask.rs) 加容量检查后越界返回错误，不再读出幽灵核。
 
+## 视频演示
+
+[SMP=16 演示录屏（2026-10-06）](https://daivy2333.github.io/OhMyOs/notes/%E8%A7%86%E9%A2%91/screen-recording-2026-10-06/)：ping 百度与经宿主机服务器拉取文件，网卡收发与串口输出均正常（[mp4 直链](https://daivy2333.github.io/OhMyOs/video/screen-recording-2026-10-06.mp4)）。
+
 ## 不足与后续
 
 异步串口和异步网卡的开发基本完成。受时间、精力和能力限制，性能优化与基准对比测试还没做；到本报告完成时，SMP=16 多核场景也只在 QEMU 上验证了串口与网卡的输入输出，K3 真板验证待做。后续我会在 K3 真板上继续做能落地的工作，并一直在日志仓库更新周报直至实习正式结束。
